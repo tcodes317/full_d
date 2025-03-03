@@ -183,6 +183,45 @@ app.post("/logout", (req, res)=>{
 })
 
 
+// Encrypt Token
+function encryptToken(email) {
+  try {
+    const iv = crypto.randomBytes(16); // IV must be 16 bytes for AES-256-CBC
+    const cipher = crypto.createCipheriv("aes-256-cbc", Buffer.from(secretKey), iv);
+
+    let encrypted = cipher.update(email, "utf8", "hex");
+    encrypted += cipher.final("hex");
+
+    return `${iv.toString("hex")}:${encrypted}`; // Store IV and encrypted email
+  } catch (error) {
+    console.error("Encryption error:", error);
+    throw error;
+  }
+}
+
+
+// Decrypt Token
+function decryptToken(encryptedToken) {
+  try {
+    console.log("Received Token:", encryptedToken);
+
+    const parts = encryptedToken.split(":");
+    if (parts.length !== 2) throw new Error("Invalid token format");
+
+    const iv = Buffer.from(parts[0], "hex");
+    const encryptedData = parts[1];
+
+    const decipher = crypto.createDecipheriv("aes-256-cbc", Buffer.from(secretKey), iv);
+    let decrypted = decipher.update(encryptedData, "hex", "utf8");
+    decrypted += decipher.final("utf8");
+
+    return decrypted; // Return the decrypted email
+  } catch (error) {
+    console.error("Decryption Error:", error);
+    return null; // Return null if decryption fails
+  }
+}
+
 // Object to store temporary reset tokens
 const resetTokens = {}; // Temporary storage. Needed in forgot-password
 
@@ -196,6 +235,7 @@ app.post("/forgot-password", (req, res) => {
 
     // Generate a reset token
     const resetToken = crypto.randomBytes(32).toString("hex");
+    const encryptedToken = encryptToken(resetToken);
     const resetTokenExpiry = Date.now() + 3600000; // 1 hour expiry
 
     resetTokens[email] = { resetToken, resetTokenExpiry };
@@ -207,8 +247,7 @@ app.post("/forgot-password", (req, res) => {
       }
     }, 3600000);
 
-    // Reset link with the plain token
-    const resetLink = `http://localhost:5173/reset-password/${resetToken}`;
+    const resetLink = `http://localhost:5173/reset-password/${encryptedToken}`;
     console.log("Reset link:", resetLink);
 
     // Email configuration
@@ -229,51 +268,68 @@ app.post("/forgot-password", (req, res) => {
   });
 });
 
-app.post("/reset-password/:resetToken", (req, res) => {
-  const { resetToken } = req.params; // Token from URL
-  const { newPassword } = req.body; // New password sent in the body
+app.post("/reset-password/:token", async (req, res) => {
+  try {
+    const encryptedToken = req.params.token;
+    console.log("Received Encrypted Token:", encryptedToken);
 
-  if (!newPassword) return res.status(400).json({ error: "New password is required" });
+    let email = decryptToken(encryptedToken); // Decrypt the token and get email
+    console.log("Decrypted Email:", email);
 
-  // Find the email associated with the reset token
-  let emailFound = null;
-
-  // Check if the token exists in the resetTokens object
-  for (const [email, tokenData] of Object.entries(resetTokens)) {
-    if (tokenData.resetToken === resetToken) {
-      emailFound = email;
-      break;
+    // If decryption fails or email is null, return error
+    if (!email) {
+      return res.status(400).json({ error: "Invalid or expired reset link." });
     }
-  }
 
-  // If no token match is found
-  if (!emailFound) return res.status(400).json({ error: "Invalid or expired token" });
-
-  // Check if the token is expired
-  const tokenData = resetTokens[emailFound];
-  if (Date.now() > tokenData.resetTokenExpiry) {
-    delete resetTokens[emailFound]; // Remove expired token
-    return res.status(400).json({ error: "Token has expired" });
-  }
-
-  // Proceed to update the user's password in the database
-  const hashedPassword = bcrypt.hashSync(newPassword, 10); // Hash the password
-
-  db.query(
-    "UPDATE users SET password = ? WHERE email = ?",
-    [hashedPassword, emailFound],
-    (err, results) => {
-      if (err) return res.status(500).json({ error: "Database error." });
-
-      // Successfully updated password, remove the reset token
-      delete resetTokens[emailFound];
-
-      res.status(200).json({ message: "Password reset successfully." });
+    const { newPassword, confirmPassword } = req.body;
+    
+    // Validation of new password and confirm password
+    if (!newPassword || !confirmPassword) {
+      return res.status(400).json({ error: "Both fields are required." });
     }
-  );
+
+    if (newPassword !== confirmPassword) {
+      return res.status(400).json({ error: "Passwords do not match." });
+    }
+
+    if (newPassword.length < 6) {
+      return res.status(400).json({ error: "Password must be at least 6 characters long." });
+    }
+
+    // Check if user exists in the database
+    db.query("SELECT id FROM users WHERE email = ?", [email], (err, results) => {
+      if (err) {
+        console.error("Database error:", err);
+        return res.status(500).json({ error: "Database error." });
+      }
+
+      if (results.length === 0) {
+        return res.status(404).json({ error: "User not found." });
+      }
+
+      // Hash the new password
+      bcrypt.hash(newPassword, 10, (hashErr, hashedPassword) => {
+        if (hashErr) {
+          console.error("Error hashing password:", hashErr);
+          return res.status(500).json({ error: "Error hashing password." });
+        }
+
+        // Update the user's password in the database
+        db.query("UPDATE users SET password = ? WHERE email = ?", [hashedPassword, email], (updateErr) => {
+          if (updateErr) {
+            console.error("Error updating password:", updateErr);
+            return res.status(500).json({ error: "Database error." });
+          }
+
+          res.status(200).json({ message: "Password reset successful. Please log in with your new password." });
+        });
+      });
+    });
+  } catch (error) {
+    console.error("Reset Password Error:", error);
+    res.status(500).json({ error: "Internal server error." });
+  }
 });
-
-
 
 app.listen(port, () => {
     console.log(`Server running on http://localhost:${port}`);
